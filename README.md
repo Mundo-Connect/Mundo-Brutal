@@ -1,19 +1,32 @@
-# TCP Mundo
+# Mundo X Brutal
 
-TCP Mundo is a Linux TCP congestion-control module derived from the TCP Brutal
-ABI but with adaptive bandwidth probing.
+Mundo X Brutal is a Linux TCP congestion-control module derived from the TCP
+Brutal ABI but with adaptive bandwidth probing.
+
+Mundo X Brutal is part of the Mundo Connect Project, the world-engine project
+for connecting the world.
+
+- Website: <https://668993.xyz>
+- Telegram: <https://t.me/mconnectofficial>
+- License: MIT License
 
 It registers a congestion-control algorithm named `mundo`. Applications enable
-it with `TCP_CONGESTION`, then pass the existing TCP Brutal-compatible sockopt
-`TCP_BRUTAL_PARAMS = 23301`.
+the Mundo X Brutal congestion control with `TCP_CONGESTION`, then pass the
+existing TCP Brutal-compatible sockopt `TCP_BRUTAL_PARAMS = 23301`.
+
+The syscall/sockopt code is compatible with TCP Brutal:
+
+```c
+#define TCP_BRUTAL_PARAMS 23301
+```
 
 Unlike TCP Brutal, `rate` is interpreted as the negotiated maximum send rate,
 not the fixed send rate. The application should negotiate the minimum of the
-server limit and the client limit, then pass that value to Mundo.
+server limit and the client limit, then pass that value to Mundo X Brutal.
 
-Mundo is intended to run on the sending side, typically the server side. The
-client can remain a normal TCP receiver with its ordinary congestion-control
-configuration.
+Mundo X Brutal is intended to run on the sending side, typically the server
+side. The client can remain a normal TCP receiver with its ordinary
+congestion-control configuration.
 
 ```c
 struct mundo_params {
@@ -24,8 +37,8 @@ struct mundo_params {
 
 ## Algorithm
 
-Mundo keeps a small per-connection sliding window of ACK/loss samples. It treats
-packet loss and peak bandwidth as separate signals:
+Mundo X Brutal keeps a small per-connection sliding window of ACK/loss samples.
+It treats packet loss and peak bandwidth as separate signals:
 
 - all samples, including low-demand periods, update the filtered loss baseline;
 - only non app-limited samples participate in peak-bandwidth probing;
@@ -46,10 +59,10 @@ and changes the internal target rate:
 - pacing rate: internal target plus small filtered-loss headroom, capped by the
   negotiated maximum.
 
-This is intentionally not BBR. Mundo does not estimate BtlBw/RTprop or run a
-BBR state machine. It is closer to an adaptive Brutal-style pacer: aggressive,
-bounded by the negotiated maximum, and filtered so short network jitter is not
-treated as a real client bandwidth drop.
+This is intentionally not BBR. Mundo X Brutal does not estimate BtlBw/RTprop or
+run a BBR state machine. It is closer to an adaptive Brutal-style pacer:
+aggressive, bounded by the negotiated maximum, and filtered so short network
+jitter is not treated as a real client bandwidth drop.
 
 The kernel module uses only the TCP congestion-control private area. There is no
 per-connection dynamic allocation; connection state is released with the TCP

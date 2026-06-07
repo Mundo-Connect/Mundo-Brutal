@@ -31,7 +31,7 @@ def main(host, port, buf_size, limit_mbps):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="TCP Mundo example client")
+    parser = argparse.ArgumentParser(description="Mundo X Brutal example client")
     parser.add_argument("host")
     parser.add_argument("limit_mbps", type=int)
     parser.add_argument("-p", "--port", type=int, default=DEFAULT_PORT)

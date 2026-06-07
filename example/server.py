@@ -37,7 +37,7 @@ def client_thread(conn, addr, duration, buffer_size, max_rate_bps, cwnd_gain):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="TCP Mundo example server")
+    parser = argparse.ArgumentParser(description="Mundo X Brutal example server")
     parser.add_argument("-l", "--listen", default="", help="Address to listen on")
     parser.add_argument("-p", "--port", type=int, default=DEFAULT_PORT)
     parser.add_argument("-d", "--duration", type=int, default=30)

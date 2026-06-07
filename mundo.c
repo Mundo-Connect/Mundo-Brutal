@@ -8,7 +8,7 @@
 #if IS_ENABLED(CONFIG_IPV6) && LINUX_VERSION_CODE >= KERNEL_VERSION(5, 8, 0)
 #include <net/transp_v6.h>
 #else
-#warning IPv6 support is disabled. Mundo will only work with IPv4. \
+#warning IPv6 support is disabled. Mundo X Brutal will only work with IPv4. \
  Please enable CONFIG_IPV6 and use Linux 5.8 or newer for IPv6 support.
 #endif
 
@@ -508,7 +508,7 @@ static void __exit mundo_unregister(void)
 module_init(mundo_register);
 module_exit(mundo_unregister);
 
-MODULE_AUTHOR("Mundo contributors");
-MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("TCP Mundo adaptive aggressive pacing");
+MODULE_AUTHOR("Mundo Connect Project");
+MODULE_LICENSE("Dual MIT/GPL");
+MODULE_DESCRIPTION("Mundo X Brutal congestion control for Mundo Connect Project");
 MODULE_VERSION("0.1.0");
