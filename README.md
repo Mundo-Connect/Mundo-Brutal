@@ -10,7 +10,7 @@ for connecting the world.
 - Telegram: <https://t.me/mconnectofficial>
 - License: MIT License
 
-It registers a congestion-control algorithm named `mundo`. Applications enable
+It registers a congestion-control algorithm named `brutal`. Applications enable
 the Mundo X Brutal congestion control with `TCP_CONGESTION`, then pass the
 existing TCP Brutal-compatible sockopt `TCP_BRUTAL_PARAMS = 23301`.
 

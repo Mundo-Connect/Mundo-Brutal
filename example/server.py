@@ -15,7 +15,7 @@ def mbps_to_bytes(value):
 
 
 def configure_mundo(conn, max_rate_bps, cwnd_gain):
-    conn.setsockopt(socket.IPPROTO_TCP, TCP_CONGESTION, b"mundo")
+    conn.setsockopt(socket.IPPROTO_TCP, TCP_CONGESTION, b"brutal")
     params = struct.pack("=QI", max_rate_bps, cwnd_gain)
     conn.setsockopt(socket.IPPROTO_TCP, TCP_BRUTAL_PARAMS, params)
 
@@ -49,7 +49,7 @@ def main():
     server_max_bps = mbps_to_bytes(args.server_max_mbps)
 
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
-        listener.setsockopt(socket.IPPROTO_TCP, TCP_CONGESTION, b"mundo")
+        listener.setsockopt(socket.IPPROTO_TCP, TCP_CONGESTION, b"brutal")
         listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         listener.bind((args.listen, args.port))
         listener.listen()
