@@ -476,7 +476,7 @@ static u32 mundo_ssthresh(struct sock *sk)
 
 static struct tcp_congestion_ops tcp_mundo_ops = {
     .flags = TCP_CONG_NON_RESTRICTED,
-    .name = "mundo",
+    .name = "brutal",
     .owner = THIS_MODULE,
     .init = mundo_init,
     .cong_control = mundo_main,
