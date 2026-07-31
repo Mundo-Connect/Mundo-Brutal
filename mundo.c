@@ -1,6 +1,7 @@
 #include <linux/module.h>
 #include <linux/version.h>
 #include <linux/limits.h>
+#include <linux/jiffies.h>
 #include <linux/hashtable.h>
 #include <linux/jhash.h>
 #include <linux/slab.h>
@@ -39,6 +40,12 @@
 
 #define TCP_BRUTAL_PARAMS 23301
 #define MUNDO_PEER_HASH_BITS 8
+#define MUNDO_USER_TIMEOUT_MS 120000U
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 19, 0)
+#define MUNDO_USER_TIMEOUT msecs_to_jiffies(MUNDO_USER_TIMEOUT_MS)
+#else
+#define MUNDO_USER_TIMEOUT MUNDO_USER_TIMEOUT_MS
+#endif
 
 #ifndef ICSK_CA_PRIV_SIZE
 #error "ICSK_CA_PRIV_SIZE not defined"
@@ -59,7 +66,6 @@ static u64 tcp_sock_get_sec(const struct tcp_sock *tp)
     return div_u64(tp->tcp_mstamp.stamp_us, USEC_PER_SEC);
 }
 #else
-#include <linux/jiffies.h>
 static u64 tcp_sock_get_sec(const struct tcp_sock *tp)
 {
     return div_u64(jiffies_to_usecs(tcp_time_stamp), USEC_PER_SEC);
@@ -486,6 +492,9 @@ static int mundo_set_params(struct sock *sk, char __user *optval, unsigned int o
     {
         mundo_peer_limit(mundo->peer, params.rate);
     }
+    if (!inet_csk(sk)->icsk_user_timeout)
+        inet_csk(sk)->icsk_user_timeout = MUNDO_USER_TIMEOUT;
+
     max_rate = mundo_max_rate(mundo);
     mundo->cwnd_gain = params.cwnd_gain;
     if (mundo->rate > max_rate)
@@ -564,9 +573,15 @@ static void mundo_release(struct sock *sk)
 
 static void mundo_cwnd_event(struct sock *sk, enum tcp_ca_event event)
 {
+    struct mundo *mundo = inet_csk_ca(sk);
+
+    if (event == CA_EVENT_LOSS)
+    {
+        mundo_peer_set_active(mundo, false);
+    }
     if (event == CA_EVENT_TX_START)
     {
-        mundo_peer_set_active(inet_csk_ca(sk), true);
+        mundo_peer_set_active(mundo, true);
         mundo_apply_rate(sk);
     }
 }
@@ -582,8 +597,7 @@ static void mundo_main(struct sock *sk, const struct rate_sample *rs)
     u32 sec = (u32)tcp_sock_get_sec(tp);
     u32 mss = tp->mss_cache;
 
-    if (!tcp_packets_in_flight(tp))
-        mundo_peer_set_active(mundo, false);
+    mundo_peer_set_active(mundo, tcp_packets_in_flight(tp) != 0);
     if (rs->delivered < 0 || rs->interval_us <= 0)
         return;
 

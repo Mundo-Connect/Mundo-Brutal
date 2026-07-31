@@ -33,6 +33,13 @@ between connections that currently have data in flight. Idle connections keep
 their tuple reference but consume no bandwidth share. The lowest limit seen
 during a tuple's lifetime remains in effect until its last connection closes.
 
+Installing `TCP_BRUTAL_PARAMS` also supplies a two-minute TCP user timeout when
+the application has not configured one. A connection with persistently
+unacknowledged data is therefore closed by TCP's existing retransmission timer
+instead of retaining its tuple and bandwidth share for the global
+`tcp_retries2` lifetime. Idle connections with no outstanding data are
+unaffected.
+
 This address-level identity intentionally treats clients behind the same public
 NAT address as one endpoint. Applications that need account-level isolation
 must continue to enforce that policy above TCP.
