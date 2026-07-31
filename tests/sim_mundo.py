@@ -22,28 +22,24 @@ class MundoModel:
             self.rate = max(INIT_RATE, max_rate / FAST_START_DIV)
         else:
             self.rate = min(INIT_RATE, max_rate)
-        self.loss_ewma = 0
         self.peak_delivery = 0
-        self.stable_rounds = 0
         self.bad_rounds = 0
 
     def pacing_rate(self):
         return min(self.rate + self.rate * HEADROOM / 1000, self.max_rate)
 
-    def raise_rate(self, fast):
-        if fast:
-            step = self.rate / 2
-        else:
-            step = self.rate / 4
+    def raise_rate(self):
+        if self.rate >= self.max_rate:
+            return
+        step = self.rate / 2
         gap = self.max_rate - self.rate
         self.rate = min(self.max_rate, self.rate + min(max(step, MIN_PROBE_STEP), gap))
 
-    def tick(self, loss, goodput, active=True):
-        loss_pm = int(loss * 1000)
-        self.loss_ewma = loss_pm if self.loss_ewma == 0 else (self.loss_ewma * 7 + loss_pm) >> 3
+    def tick(self, goodput, active=True):
         if not active:
             return
 
+        target = min(self.rate, self.max_rate)
         delivery_ceiling = goodput * (1000 + DELIVERY_HEADROOM) / 1000
         if goodput > self.peak_delivery:
             self.peak_delivery = goodput
@@ -51,14 +47,13 @@ class MundoModel:
         peak_growth = max(self.peak_delivery * DELIVERY_FLAT / 1000, 16 * 1024)
         plateau = (
             delivery_ceiling > MIN_RATE
-            and self.rate > delivery_ceiling
-            and self.rate - delivery_ceiling > self.rate * DELIVERY_LOW / 1000
+            and target > delivery_ceiling
+            and target - delivery_ceiling > target * DELIVERY_LOW / 1000
             and self.peak_delivery
             and goodput <= self.peak_delivery + peak_growth
         )
 
         if plateau:
-            self.stable_rounds = 0
             if self.bad_rounds < BAD_CONFIRM:
                 self.bad_rounds += 1
             if self.bad_rounds >= BAD_CONFIRM:
@@ -68,9 +63,64 @@ class MundoModel:
                 self.bad_rounds = 0
         else:
             self.bad_rounds = 0
-            self.stable_rounds = min(255, self.stable_rounds + 1)
-            self.raise_rate(True)
+            self.raise_rate()
 
+
+
+class PeerLimit:
+    def __init__(self):
+        self.max_rate = 0
+        self.refs = 0
+        self.active = set()
+        self.next_id = 0
+
+    def attach(self, max_rate):
+        self.max_rate = min(self.max_rate, max_rate) if self.refs else max_rate
+        self.refs += 1
+        self.next_id += 1
+        return self.next_id
+
+    def set_active(self, connection, active):
+        if active:
+            self.active.add(connection)
+        else:
+            self.active.discard(connection)
+
+    def detach(self, connection):
+        self.set_active(connection, False)
+        self.refs -= 1
+        if not self.refs:
+            self.max_rate = 0
+
+    def share(self):
+        return max(1, self.max_rate // max(1, len(self.active)))
+
+
+def test_tuple_limit_is_shared_and_released():
+    peer = PeerLimit()
+    connections = [peer.attach(rate) for rate in (125_000_000, 100_000_000, 125_000_000)]
+    peer.set_active(connections[0], True)
+    assert peer.share() == 100_000_000
+    peer.set_active(connections[0], True)
+    assert len(peer.active) == 1
+    peer.set_active(connections[1], True)
+    assert len(peer.active) * peer.share() <= 100_000_000
+    peer.detach(connections[0])
+    assert peer.share() == 100_000_000
+    peer.detach(connections[1])
+    peer.detach(connections[2])
+    assert (peer.refs, peer.max_rate, peer.active) == (0, 0, set())
+
+
+def test_shared_cap_does_not_erase_learned_bandwidth():
+    model = MundoModel(100_000_000)
+    model.rate = 100_000_000
+    model.max_rate = 50_000_000
+    model.tick(50_000_000)
+    model.tick(50_000_000)
+    assert model.rate == 100_000_000
+    model.max_rate = 100_000_000
+    assert model.pacing_rate() == 100_000_000
 
 
 def loss_model(send_rate, capacity, rng, jitter=False):
@@ -97,8 +147,8 @@ def run(capacity_fn, seconds=220, max_mbps=200, jitter=False, seed=7):
         send = model.pacing_rate()
         loss = loss_model(send, cap, rng, jitter=jitter)
         goodput = delivered(send, cap, loss)
-        model.tick(loss, goodput)
-        rows.append((sec, cap, send, goodput, loss, model.rate, model.loss_ewma))
+        model.tick(goodput)
+        rows.append((sec, cap, send, goodput, loss, model.rate))
     return rows
 
 
@@ -116,8 +166,8 @@ def run_demand(capacity_fn, demand_fn, seconds=220, max_mbps=1000, jitter=False,
         active = demand >= wanted * 0.95 or (
             model.peak_delivery and goodput >= model.peak_delivery / APP_LIMITED_PROBE_DIV
         )
-        model.tick(loss, goodput, active=active)
-        rows.append((sec, cap, demand, wanted, send, goodput, loss, model.rate, model.loss_ewma))
+        model.tick(goodput, active=active)
+        rows.append((sec, cap, demand, wanted, send, goodput, loss, model.rate))
     return rows
 
 
@@ -232,6 +282,8 @@ def test_mixed_rollercoaster_demand():
 
 
 if __name__ == "__main__":
+    test_tuple_limit_is_shared_and_released()
+    test_shared_cap_does_not_erase_learned_bandwidth()
     test_converges_without_waste()
     test_reaches_limit_quickly_when_clean()
     test_tracks_capacity_changes()

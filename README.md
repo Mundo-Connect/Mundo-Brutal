@@ -24,6 +24,19 @@ Unlike TCP Brutal, `rate` is interpreted as the negotiated maximum send rate,
 not the fixed send rate. The application should negotiate the minimum of the
 server limit and the client limit, then pass that value to Mundo X Brutal.
 
+On established server-side sockets, the negotiated rate is shared by the
+three-tuple `(client IP, server IP, server port)`. The client source port is
+deliberately excluded, so parallel TCP connections from the same endpoint share
+one aggregate limit instead of multiplying it. Each connection keeps its own
+RTT and delivery model; only the configured maximum is shared and split
+between connections that currently have data in flight. Idle connections keep
+their tuple reference but consume no bandwidth share. The lowest limit seen
+during a tuple's lifetime remains in effect until its last connection closes.
+
+This address-level identity intentionally treats clients behind the same public
+NAT address as one endpoint. Applications that need account-level isolation
+must continue to enforce that policy above TCP.
+
 Mundo X Brutal is intended to run on the sending side, typically the server
 side. The client can remain a normal TCP receiver with its ordinary
 congestion-control configuration.
@@ -37,10 +50,8 @@ struct mundo_params {
 
 ## Algorithm
 
-Mundo X Brutal keeps a small per-connection sliding window of ACK/loss samples.
-It treats packet loss and peak bandwidth as separate signals:
+Mundo X Brutal keeps a small per-connection sliding window of delivered ACKs:
 
-- all samples, including low-demand periods, update the filtered loss baseline;
 - only non app-limited samples participate in peak-bandwidth probing;
 - app-limited samples that are still large enough to stress the link may also
   participate, so medium downloads can detect a lower client-side bottleneck;
@@ -49,13 +60,12 @@ It treats packet loss and peak bandwidth as separate signals:
 - idle or low-demand periods do not reset the learned target rate, so later
   bursts can start near the previous estimate instead of climbing from 100 Kbps.
 
-Every second it filters loss with an EWMA, cross-checks delivered ACK throughput,
-and changes the internal target rate:
+Every second it checks delivered ACK throughput and changes the internal target
+rate:
 
-- low filtered loss: probe upward with large early steps, then taper near the
-  negotiated limit;
+- available delivery headroom: probe upward with large early steps;
 - one short spike: hold rate;
-- confirmed high filtered loss or sustained ACK-throughput plateau: reduce rate;
+- sustained ACK-throughput plateau: reduce rate;
 - pacing rate: internal target plus small filtered-loss headroom, capped by the
   negotiated maximum.
 
@@ -64,9 +74,11 @@ run a BBR state machine. It is closer to an adaptive Brutal-style pacer:
 aggressive, bounded by the negotiated maximum, and filtered so short network
 jitter is not treated as a real client bandwidth drop.
 
-The kernel module uses only the TCP congestion-control private area. There is no
-per-connection dynamic allocation; connection state is released with the TCP
-socket.
+The ACK path uses a cached pointer and never looks up the tuple table. TCP's
+existing transmit-start event tracks active connections without timers or
+scans. One small entry is allocated per live tuple; the table is touched only
+when socket parameters are installed or a connection is released, and the
+entry is freed immediately after its final connection.
 
 ## Build
 
