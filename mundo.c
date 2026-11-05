@@ -10,33 +10,21 @@
 #include <linux/math64.h>
 #include <net/tcp.h>
 
-#if IS_ENABLED(CONFIG_IPV6) && LINUX_VERSION_CODE >= KERNEL_VERSION(5, 8, 0)
-#include <net/transp_v6.h>
-#else
-#warning IPv6 support is disabled. Mundo X Brutal will only work with IPv4. \
- Please enable CONFIG_IPV6 and use Linux 5.8 or newer for IPv6 support.
+#if IS_ENABLED(CONFIG_TLS)
+#include <net/tls.h>
 #endif
 
-#define INIT_PACING_RATE 125000ULL /* 1 Mbps */
-#define MIN_PACING_RATE 62500ULL   /* 500 Kbps */
+#if IS_ENABLED(CONFIG_IPV6) && LINUX_VERSION_CODE >= KERNEL_VERSION(5, 8, 0)
+#include <net/transp_v6.h>
+#endif
+
+#define MIN_CONFIG_RATE 62500ULL   /* 500 Kbps negotiated ceiling */
 #define MAX_PACING_RATE 1250000000000ULL /* 10 Tbps */
 
 #define INIT_CWND_GAIN 18
 #define MIN_CWND_GAIN 5
 #define MAX_CWND_GAIN 80
 #define MIN_CWND 4
-#define FALLBACK_MSS 536
-
-#define MIN_PKT_INFO_SAMPLES 50
-#define HEADROOM_PERMILLE 5
-#define DELIVERY_HEADROOM_PERMILLE 30
-#define DELIVERY_LOW_PERMILLE 50
-#define DELIVERY_FLAT_PERMILLE 30
-#define BAD_CONFIRM_ROUNDS 2
-#define APP_LIMITED_PROBE_DIV 16
-#define MIN_PROBE_STEP 16384ULL
-#define FAST_START_DIV 4
-#define DIRECT_START_RATE 1000000ULL /* 8 Mbps */
 
 #define TCP_BRUTAL_PARAMS 23301
 #define MUNDO_PEER_HASH_BITS 8
@@ -47,28 +35,20 @@
 #define MUNDO_USER_TIMEOUT MUNDO_USER_TIMEOUT_MS
 #endif
 
-#ifndef ICSK_CA_PRIV_SIZE
-#error "ICSK_CA_PRIV_SIZE not defined"
-#else
-#define MUNDO_FIXED_PRIV_SIZE 32
-#define RAW_PKT_INFO_SLOTS ((ICSK_CA_PRIV_SIZE - MUNDO_FIXED_PRIV_SIZE) / sizeof(u32))
-#define PKT_INFO_SLOTS (RAW_PKT_INFO_SLOTS < 3 ? 3 : (RAW_PKT_INFO_SLOTS > 4 ? 4 : RAW_PKT_INFO_SLOTS))
-#endif
-
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 13, 0)
-static u64 tcp_sock_get_sec(const struct tcp_sock *tp)
+static u32 mundo_stamp(const struct tcp_sock *tp)
 {
-    return div_u64(tp->tcp_mstamp, USEC_PER_SEC);
+    return tp->tcp_mstamp;
 }
 #elif LINUX_VERSION_CODE >= KERNEL_VERSION(4, 12, 0)
-static u64 tcp_sock_get_sec(const struct tcp_sock *tp)
+static u32 mundo_stamp(const struct tcp_sock *tp)
 {
-    return div_u64(tp->tcp_mstamp.stamp_us, USEC_PER_SEC);
+    return tp->tcp_mstamp.stamp_us;
 }
 #else
-static u64 tcp_sock_get_sec(const struct tcp_sock *tp)
+static u32 mundo_stamp(const struct tcp_sock *tp)
 {
-    return div_u64(jiffies_to_usecs(tcp_time_stamp), USEC_PER_SEC);
+    return jiffies_to_usecs(tcp_time_stamp);
 }
 #endif
 
@@ -82,11 +62,13 @@ struct mundo_peer_key
             __be32 remote;
             __be32 local;
         } v4;
+#ifdef _TRANSP_V6_H
         struct
         {
             struct in6_addr remote;
             struct in6_addr local;
         } v6;
+#endif
     } addr;
     __be16 port;
     u16 family;
@@ -107,15 +89,14 @@ static DEFINE_SPINLOCK(mundo_peers_lock);
 struct mundo
 {
     struct mundo_peer *peer;
-    u64 rate;
-    u32 last_sec;
-    u32 peak_delivery;
+    u64 rate; /* Payload bytes/s; TCP pacing accounts for packet headers. */
+    u64 delivery;
+    u32 stamp;
+    u32 delivered;
+    int active; /* Last tuple count used for pacing. */
     u8 cwnd_gain;
-    u8 bad_rounds;
-    u8 slot;
-    u8 active_mask;
+    u8 round;
     u8 peer_active;
-    u32 slots[PKT_INFO_SLOTS];
 };
 
 struct mundo_params
@@ -227,14 +208,15 @@ static void mundo_peer_put(struct mundo_peer *peer)
         kfree(peer);
 }
 
-static u64 mundo_max_rate(const struct mundo *mundo)
+static u64 mundo_max_rate(struct mundo *mundo)
 {
     struct mundo_peer *peer = mundo->peer;
     int active;
 
     if (!peer)
-        return INIT_PACING_RATE;
+        return MAX_PACING_RATE;
     active = atomic_read(&peer->active);
+    mundo->active = active;
     return max_t(u64, div_u64(atomic64_read(&peer->max_rate), max(active, 1)), 1);
 }
 
@@ -254,201 +236,135 @@ static struct proto tcp_prot_override __ro_after_init;
 static struct proto tcpv6_prot_override __ro_after_init;
 #endif
 
-static inline u32 mundo_tcp_snd_cwnd(const struct tcp_sock *tp)
-{
-    return tp->snd_cwnd;
-}
+/* The TCP socket lock serializes parameters, ACKs and CA teardown. */
+static struct tcp_congestion_ops tcp_mundo_ops;
 
-static inline void mundo_tcp_snd_cwnd_set(struct tcp_sock *tp, u32 val)
+static void mundo_reset_sample(struct mundo *mundo, const struct tcp_sock *tp)
 {
-    WARN_ON_ONCE((int)val <= 0);
-    tp->snd_cwnd = val;
+    mundo->stamp = mundo_stamp(tp);
+    mundo->delivered = tp->delivered;
 }
 
 static void mundo_apply_rate(struct sock *sk)
 {
     struct tcp_sock *tp = tcp_sk(sk);
     struct mundo *mundo = inet_csk_ca(sk);
-    u64 rate = mundo->rate;
-    u64 max_rate = mundo_max_rate(mundo);
-    u64 pacing;
-    u64 max_pacing;
+    u64 pacing = mundo->rate;
     u64 cwnd;
-    u32 mss = tp->mss_cache;
-    u32 rtt_ms = (tp->srtt_us >> 3) / USEC_PER_MSEC;
+    u32 rtt = max(tp->srtt_us >> 3, 1U);
+    u32 mtu = tcp_mss_to_mtu(sk, tp->mss_cache);
 
-    if (mss < FALLBACK_MSS)
-        mss = FALLBACK_MSS;
-    if (!rtt_ms)
-        rtt_ms = 1;
+    if (!pacing)
+    {
+        /* ACK-driven startup: grow the existing TCP window, not a fraction
+         * of an arbitrarily large configured bandwidth ceiling. */
+        u64 bytes = min_t(u64, (u64)tp->snd_cwnd * mtu,
+                          (MAX_PACING_RATE / USEC_PER_SEC) * rtt);
+        pacing = mul_u64_u32_div(bytes, 2 * USEC_PER_SEC, rtt);
+    }
+    else
+        /* The learned rate is bounded and MSS is negotiated in 16 bits. */
+        pacing = div_u64(pacing * mtu, tp->mss_cache);
+    pacing = min_t(u64, pacing, mundo_max_rate(mundo));
+    pacing = min_t(u64, pacing, READ_ONCE(sk->sk_max_pacing_rate));
 
-    pacing = rate + div_u64(rate * HEADROOM_PERMILLE, 1000);
-    pacing = min_t(u64, pacing, max_rate);
-
-    cwnd = div_u64(pacing, MSEC_PER_SEC);
-    cwnd *= rtt_ms;
-    cwnd = div_u64(cwnd, mss);
-    cwnd *= mundo->cwnd_gain;
-    cwnd = div_u64(cwnd, 10);
-    cwnd = max_t(u64, cwnd, MIN_CWND);
-    cwnd = min_t(u64, cwnd, tp->snd_cwnd_clamp);
-
-    mundo_tcp_snd_cwnd_set(tp, (u32)cwnd);
-
-    max_pacing = READ_ONCE(sk->sk_max_pacing_rate);
-    if (max_pacing)
-        pacing = min_t(u64, pacing, max_pacing);
+    if (mundo->rate)
+    {
+        /* Keep microsecond precision and avoid rate * RTT overflow on 32/64 bit. */
+        cwnd = mul_u64_u32_div(pacing, rtt, USEC_PER_SEC);
+        cwnd = div_u64(cwnd * mundo->cwnd_gain, 10 * mtu);
+        tp->snd_cwnd = min_t(u64, max_t(u64, cwnd, MIN_CWND), tp->snd_cwnd_clamp);
+    }
     WRITE_ONCE(sk->sk_pacing_rate, pacing);
 }
 
-static void mundo_raise_rate(struct mundo *mundo, u64 max_rate)
-{
-    u64 step;
-
-    if (mundo->rate >= max_rate)
-        return;
-
-    step = mundo->rate >> 1;
-    step = max_t(u64, step, MIN_PROBE_STEP);
-    mundo->rate += min_t(u64, step, max_rate - mundo->rate);
-}
-
-static u32 mundo_rate_unit(u64 rate)
-{
-    rate = div_u64(rate, 1024);
-    return (u32)min_t(u64, rate, U32_MAX);
-}
-
-static u64 mundo_unit_rate(u32 unit)
-{
-    return (u64)unit * 1024;
-}
-
-static u64 mundo_delivery_ceiling(u32 delivery)
-{
-    u64 rate = mundo_unit_rate(delivery);
-
-    return rate + div_u64(rate * DELIVERY_HEADROOM_PERMILLE, 1000);
-}
-
-static void mundo_reduce_rate(struct mundo *mundo, u64 ceiling, u64 max_rate)
-{
-    mundo->rate = min_t(u64, max_t(u64, ceiling, MIN_PACING_RATE), max_rate);
-}
-
-static void mundo_update_model(struct sock *sk)
+static void mundo_update_model(struct sock *sk, u32 elapsed, u32 packets)
 {
     struct tcp_sock *tp = tcp_sk(sk);
     struct mundo *mundo = inet_csk_ca(sk);
-    u64 active_acked = 0;
-    u64 delivery_rate;
-    u64 delivery_ceiling;
-    u64 max_rate = mundo_max_rate(mundo);
-    u64 target = min_t(u64, mundo->rate, max_rate);
-    u32 mss = tp->mss_cache;
-    u32 delivery;
-    u32 peak_growth;
-    u8 active_slots = 0;
-    bool plateau;
+    u32 interval = max_t(u32, tp->srtt_us >> 2, mundo->rate ? USEC_PER_SEC : 100000U);
+    u64 delivery;
 
-    if (mss < FALLBACK_MSS)
-        mss = FALLBACK_MSS;
-
-    for (int i = 0; i < PKT_INFO_SLOTS; i++)
+    mundo_reset_sample(mundo, tp);
+    if (elapsed > max_t(u64, 2 * USEC_PER_SEC, (u64)interval * 4))
     {
-        if (mundo->active_mask & (1U << i))
+        /* An ACK outage is not a fresh capacity measurement. */
+        mundo->delivery = 0;
+        mundo->round = mundo->rate ? 7 : 0;
+        return;
+    }
+    /* rate_sample.delivered overlaps earlier samples; never add it per ACK. */
+    delivery = clamp_t(u64, mul_u64_u32_div((u64)packets * tp->mss_cache,
+                                          USEC_PER_SEC, elapsed), tp->mss_cache, MAX_PACING_RATE);
+    if (mundo->rate)
+    {
+        u64 pacing = READ_ONCE(sk->sk_pacing_rate);
+        u32 mtu = tcp_mss_to_mtu(sk, tp->mss_cache);
+
+        if (pacing < div_u64(mundo->rate * mtu, tp->mss_cache) &&
+            delivery >= div_u64((pacing - pacing / 8) * tp->mss_cache, mtu))
         {
-            active_slots++;
-            active_acked += mundo->slots[i];
+            /* Sharing a configured ceiling is not a loss of path capacity. */
+            mundo->delivery = delivery;
+            mundo->round = 7;
+            return;
         }
     }
-
-    if (!active_slots || active_acked < MIN_PKT_INFO_SAMPLES)
+    if (!mundo->rate)
     {
-        mundo_apply_rate(sk);
-        return;
-    }
+        u64 window = mul_u64_u32_div(delivery, tp->srtt_us >> 3, USEC_PER_SEC);
+        u32 limit = min_t(u64, max_t(u64, div_u64(2 * window, tp->mss_cache),
+                                    TCP_INIT_CWND), tp->snd_cwnd_clamp);
 
-    delivery_rate = div_u64(active_acked * mss, active_slots);
-    delivery_ceiling = delivery_rate + div_u64(delivery_rate * DELIVERY_HEADROOM_PERMILLE, 1000);
-    delivery = mundo_rate_unit(delivery_rate);
-    if (delivery > mundo->peak_delivery)
-        mundo->peak_delivery = delivery;
-
-    peak_growth = max_t(u32, div_u64((u64)mundo->peak_delivery * DELIVERY_FLAT_PERMILLE, 1000), 16);
-    plateau = delivery_ceiling > MIN_PACING_RATE &&
-              target > delivery_ceiling &&
-              (target - delivery_ceiling) >
-                  div_u64(target * DELIVERY_LOW_PERMILLE, 1000) &&
-              mundo->peak_delivery &&
-              delivery <= mundo->peak_delivery + peak_growth;
-
-    if (plateau)
-    {
-        if (mundo->bad_rounds < BAD_CONFIRM_ROUNDS)
-            mundo->bad_rounds++;
-        if (mundo->bad_rounds >= BAD_CONFIRM_ROUNDS)
+        tp->snd_cwnd = min(tp->snd_cwnd, limit);
+        if (delivery > mundo->delivery + mundo->delivery / 16)
+            mundo->round = 0;
+        else if (++mundo->round == 2)
         {
-            mundo->peak_delivery = delivery;
-            mundo_reduce_rate(mundo, mundo_delivery_ceiling(delivery), max_rate);
-            mundo->bad_rounds = 0;
+            mundo->rate = delivery;
+            mundo->round = 7;
+        }
+        else
+            return; /* Keep the startup high-water mark across a low sample. */
+    }
+    else if (mundo->round == 1)
+    {
+        if (delivery > mundo->delivery + mundo->delivery / 16)
+            mundo->rate += mundo->rate / 4;
+        else
+        {
+            mundo->rate -= mundo->rate / 5; /* undo the upward probe */
+            mundo->rate -= mundo->rate / 8;
+            mundo->round = 2;
+            delivery = mundo->delivery;
         }
     }
-    else
+    else if (mundo->round == 2)
     {
-        mundo->bad_rounds = 0;
-        mundo_raise_rate(mundo, max_rate);
-    }
-
-    mundo_apply_rate(sk);
-}
-
-static void mundo_advance_window(struct mundo *mundo, u32 sec)
-{
-    u32 elapsed;
-
-    if (mundo->last_sec == (u32)~0U)
-    {
-        mundo->last_sec = sec;
-        return;
-    }
-
-    elapsed = sec - mundo->last_sec;
-    if (!elapsed)
-        return;
-
-    if (elapsed >= PKT_INFO_SLOTS)
-    {
-        memset(mundo->slots, 0, sizeof(mundo->slots));
-        mundo->slot = 0;
-        mundo->active_mask = 0;
-    }
-    else
-    {
-        while (elapsed--)
+        if (delivery >= mundo->delivery - mundo->delivery / 32)
+            mundo->rate -= mundo->rate / 8;
+        else
         {
-            mundo->slot++;
-            if (mundo->slot >= PKT_INFO_SLOTS)
-                mundo->slot = 0;
-            mundo->slots[mundo->slot] = 0;
-            mundo->active_mask &= ~(1U << mundo->slot);
+            mundo->rate += mundo->rate / 7; /* undo the downward probe */
+            mundo->round = 3;
+            delivery = mundo->delivery;
         }
     }
-
-    mundo->last_sec = sec;
-}
-
-static void mundo_add_sample(u32 *dst, int value)
-{
-    u32 add;
-
-    if (value <= 0)
-        return;
-    add = (u32)value;
-    if (*dst > U32_MAX - add)
-        *dst = U32_MAX;
+    else if (delivery < mundo->delivery - mundo->delivery / 4)
+    {
+        mundo->rate -= mundo->rate / 8;
+        mundo->round = 2;
+    }
+    else if (mundo->round == 7)
+    {
+        mundo->rate += mundo->rate / 4;
+        mundo->round = 1;
+    }
     else
-        *dst += add;
+        mundo->round++;
+    mundo->delivery = delivery;
+    if (mundo->rate)
+        mundo->rate = clamp_t(u64, mundo->rate, tp->mss_cache, MAX_PACING_RATE);
 }
 
 #ifdef _LINUX_SOCKPTR_H
@@ -460,7 +376,7 @@ static int mundo_set_params(struct sock *sk, char __user *optval, unsigned int o
     struct mundo *mundo = inet_csk_ca(sk);
     struct mundo_params params;
     struct mundo_peer *peer;
-    u64 max_rate;
+    int err = 0;
 
     if (optlen < sizeof(params))
         return -EINVAL;
@@ -473,18 +389,30 @@ static int mundo_set_params(struct sock *sk, char __user *optval, unsigned int o
         return -EFAULT;
 #endif
 
-    if (params.rate < MIN_PACING_RATE || params.rate > MAX_PACING_RATE)
+    if (params.rate < MIN_CONFIG_RATE || params.rate > MAX_PACING_RATE)
         return -EINVAL;
     if (params.cwnd_gain < MIN_CWND_GAIN || params.cwnd_gain > MAX_CWND_GAIN)
         return -EINVAL;
 
+    lock_sock(sk);
+    if (inet_csk(sk)->icsk_ca_ops != &tcp_mundo_ops)
+    {
+        err = -ENOPROTOOPT;
+        goto out;
+    }
+    if (sk->sk_state != TCP_ESTABLISHED)
+    {
+        err = -ENOTCONN;
+        goto out;
+    }
     if (!mundo->peer)
     {
-        if (sk->sk_state != TCP_ESTABLISHED)
-            return -ENOTCONN;
         peer = mundo_peer_get(sk, params.rate);
         if (!peer)
-            return -ENOMEM;
+        {
+            err = -ENOMEM;
+            goto out;
+        }
         mundo->peer = peer;
         mundo_peer_set_active(mundo, tcp_packets_in_flight(tcp_sk(sk)) != 0);
     }
@@ -495,17 +423,11 @@ static int mundo_set_params(struct sock *sk, char __user *optval, unsigned int o
     if (!inet_csk(sk)->icsk_user_timeout)
         inet_csk(sk)->icsk_user_timeout = MUNDO_USER_TIMEOUT;
 
-    max_rate = mundo_max_rate(mundo);
     mundo->cwnd_gain = params.cwnd_gain;
-    if (mundo->rate > max_rate)
-        mundo->rate = max_rate;
-    else if (mundo->rate <= INIT_PACING_RATE && max_rate > DIRECT_START_RATE)
-        mundo->rate = max_t(u64, INIT_PACING_RATE, div_u64(max_rate, FAST_START_DIV));
-    else if (mundo->rate < MIN_PACING_RATE)
-        mundo->rate = min_t(u64, INIT_PACING_RATE, max_rate);
-
     mundo_apply_rate(sk);
-    return 0;
+out:
+    release_sock(sk);
+    return err;
 }
 
 #ifdef _LINUX_SOCKPTR_H
@@ -519,16 +441,12 @@ static int mundo_tcp_setsockopt(struct sock *sk, int level, int optname, char __
     return tcp_prot.setsockopt(sk, level, optname, optval, optlen);
 }
 
-#ifdef _TRANSP_V6_H
-#ifdef _LINUX_SOCKPTR_H
-static int mundo_tcpv6_setsockopt(struct sock *sk, int level, int optname, sockptr_t optval, unsigned int optlen)
-#else
-static int mundo_tcpv6_setsockopt(struct sock *sk, int level, int optname, char __user *optval, unsigned int optlen)
-#endif
+#if defined(CONFIG_COMPAT) && !defined(_LINUX_SOCKPTR_H)
+static int mundo_compat_setsockopt(struct sock *sk, int level, int optname, char __user *optval, unsigned int optlen)
 {
     if (level == IPPROTO_TCP && optname == TCP_BRUTAL_PARAMS)
         return mundo_set_params(sk, optval, optlen);
-    return tcpv6_prot.setsockopt(sk, level, optname, optval, optlen);
+    return tcp_prot.compat_setsockopt(sk, level, optname, optval, optlen);
 }
 #endif
 
@@ -537,27 +455,36 @@ static void mundo_init(struct sock *sk)
     struct tcp_sock *tp = tcp_sk(sk);
     struct mundo *mundo = inet_csk_ca(sk);
 
-    if (sk->sk_family == AF_INET)
-        sk->sk_prot = &tcp_prot_override;
+    if (sk->sk_prot == &tcp_prot)
+        WRITE_ONCE(sk->sk_prot, &tcp_prot_override);
 #ifdef _TRANSP_V6_H
-    else if (sk->sk_family == AF_INET6)
-        sk->sk_prot = &tcpv6_prot_override;
+    else if (sk->sk_prot == &tcpv6_prot)
+        WRITE_ONCE(sk->sk_prot, &tcpv6_prot_override);
 #endif
-    else
-        BUG();
 
     tp->snd_ssthresh = TCP_INFINITE_SSTHRESH;
 
     memset(mundo, 0, sizeof(*mundo));
-    mundo->rate = INIT_PACING_RATE;
-    mundo->last_sec = U32_MAX;
     mundo->cwnd_gain = INIT_CWND_GAIN;
+    mundo_reset_sample(mundo, tp);
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 13, 0)
     cmpxchg(&sk->sk_pacing_status, SK_PACING_NONE, SK_PACING_NEEDED);
 #endif
 
     mundo_apply_rate(sk);
+}
+
+static void mundo_restore_proto(struct proto **protp)
+{
+    struct proto *prot = READ_ONCE(*protp);
+
+    if (prot == &tcp_prot_override)
+        WRITE_ONCE(*protp, &tcp_prot);
+#ifdef _TRANSP_V6_H
+    else if (prot == &tcpv6_prot_override)
+        WRITE_ONCE(*protp, &tcpv6_prot);
+#endif
 }
 
 static void mundo_release(struct sock *sk)
@@ -569,6 +496,18 @@ static void mundo_release(struct sock *sk)
         mundo_peer_set_active(mundo, false);
         mundo_peer_put(mundo->peer);
     }
+    mundo_restore_proto(&sk->sk_prot);
+#if IS_ENABLED(CONFIG_TLS)
+    if (inet_csk(sk)->icsk_ulp_ops &&
+        !strcmp(inet_csk(sk)->icsk_ulp_ops->name, "tls"))
+    {
+        struct tls_context *ctx = tls_get_ctx(sk);
+
+        /* kTLS retains the base protocol for sockopts and close. */
+        if (ctx)
+            mundo_restore_proto(&ctx->sk_proto);
+    }
+#endif
 }
 
 static void mundo_cwnd_event(struct sock *sk, enum tcp_ca_event event)
@@ -581,6 +520,7 @@ static void mundo_cwnd_event(struct sock *sk, enum tcp_ca_event event)
     }
     if (event == CA_EVENT_TX_START)
     {
+        mundo_reset_sample(mundo, tcp_sk(sk));
         mundo_peer_set_active(mundo, true);
         mundo_apply_rate(sk);
     }
@@ -594,36 +534,36 @@ static void mundo_main(struct sock *sk, const struct rate_sample *rs)
 {
     struct tcp_sock *tp = tcp_sk(sk);
     struct mundo *mundo = inet_csk_ca(sk);
-    u32 sec = (u32)tcp_sock_get_sec(tp);
-    u32 mss = tp->mss_cache;
 
-    mundo_peer_set_active(mundo, tcp_packets_in_flight(tp) != 0);
+    u32 flight = tcp_packets_in_flight(tp);
+    bool refresh = !mundo->rate;
+
+    mundo_peer_set_active(mundo, flight != 0);
     if (rs->delivered < 0 || rs->interval_us <= 0)
         return;
-
-    if (mundo->last_sec != (u32)~0U && sec != mundo->last_sec &&
-        sec - mundo->last_sec < PKT_INFO_SLOTS)
-        mundo_update_model(sk);
-    mundo_advance_window(mundo, sec);
-
-    mundo_add_sample(&mundo->slots[mundo->slot], rs->acked_sacked);
-    if (!rs->is_app_limited)
+    if (refresh && !rs->is_app_limited)
+        tp->snd_cwnd = min_t(u64, (u64)tp->snd_cwnd + rs->acked_sacked, tp->snd_cwnd_clamp);
+    if (rs->is_app_limited && flight < max(tp->snd_cwnd / 16, 1U))
+        mundo_reset_sample(mundo, tp);
+    else
     {
-        mundo->active_mask |= 1U << mundo->slot;
+        u32 elapsed = mundo_stamp(tp) - mundo->stamp;
+        u32 packets = tp->delivered - mundo->delivered;
+        u32 interval = max_t(u32, tp->srtt_us >> 2, mundo->rate ? USEC_PER_SEC : 100000U);
+
+        if (elapsed >= interval && packets >= MIN_CWND)
+        {
+            mundo_update_model(sk, elapsed, packets);
+            refresh = true;
+        }
     }
-    else if (mundo->peak_delivery)
-    {
-        if (mss < FALLBACK_MSS)
-            mss = FALLBACK_MSS;
-        if (mundo_rate_unit((u64)mundo->slots[mundo->slot] * mss) >=
-            mundo->peak_delivery / APP_LIMITED_PROBE_DIV)
-            mundo->active_mask |= 1U << mundo->slot;
-    }
+    if (refresh || (mundo->peer && mundo->active != atomic_read(&mundo->peer->active)))
+        mundo_apply_rate(sk);
 }
 
 static u32 mundo_undo_cwnd(struct sock *sk)
 {
-    return mundo_tcp_snd_cwnd(tcp_sk(sk));
+    return tcp_sk(sk)->snd_cwnd;
 }
 
 static u32 mundo_ssthresh(struct sock *sk)
@@ -646,14 +586,20 @@ static struct tcp_congestion_ops tcp_mundo_ops = {
 static int __init mundo_register(void)
 {
     BUILD_BUG_ON(sizeof(struct mundo) > ICSK_CA_PRIV_SIZE);
-    BUILD_BUG_ON(PKT_INFO_SLOTS < 3);
+    BUILD_BUG_ON(sizeof(struct mundo_params) != 12);
 
     tcp_prot_override = tcp_prot;
     tcp_prot_override.setsockopt = mundo_tcp_setsockopt;
+#if defined(CONFIG_COMPAT) && !defined(_LINUX_SOCKPTR_H)
+    tcp_prot_override.compat_setsockopt = mundo_compat_setsockopt;
+#endif
 
 #ifdef _TRANSP_V6_H
     tcpv6_prot_override = tcpv6_prot;
-    tcpv6_prot_override.setsockopt = mundo_tcpv6_setsockopt;
+    tcpv6_prot_override.setsockopt = mundo_tcp_setsockopt;
+#if defined(CONFIG_COMPAT) && !defined(_LINUX_SOCKPTR_H)
+    tcpv6_prot_override.compat_setsockopt = mundo_compat_setsockopt;
+#endif
 #endif
 
     return tcp_register_congestion_control(&tcp_mundo_ops);

@@ -4,7 +4,7 @@ obj-m           += mundo.o
 
 ccflags-y := -std=gnu99
 
-.PHONY: all clean load unload install
+.PHONY: all clean load unload install test
 
 all:
 	$(MAKE) -C $(KERNEL_DIR) M=$(CURDIR) modules
@@ -20,3 +20,6 @@ unload:
 
 install:
 	./install.sh
+
+test:
+	python3 tests/run.py
