@@ -195,17 +195,15 @@ static void mundo_peer_limit(struct mundo_peer *peer, u64 max_rate)
 
 static void mundo_peer_put(struct mundo_peer *peer)
 {
-    bool release = false;
-
     spin_lock_bh(&mundo_peers_lock);
-    if (!--peer->refs)
+    if (--peer->refs)
     {
-        hash_del(&peer->node);
-        release = true;
+        spin_unlock_bh(&mundo_peers_lock);
+        return;
     }
+    hash_del(&peer->node);
     spin_unlock_bh(&mundo_peers_lock);
-    if (release)
-        kfree(peer);
+    kfree(peer);
 }
 
 static u64 mundo_max_rate(struct mundo *mundo)
@@ -278,24 +276,29 @@ static void mundo_apply_rate(struct sock *sk)
     WRITE_ONCE(sk->sk_pacing_rate, pacing);
 }
 
-static void mundo_update_model(struct sock *sk, u32 elapsed, u32 packets)
+static bool mundo_update_model(struct sock *sk, u32 elapsed, u32 interval, bool limited)
 {
     struct tcp_sock *tp = tcp_sk(sk);
     struct mundo *mundo = inet_csk_ca(sk);
-    u32 interval = max_t(u32, tp->srtt_us >> 2, mundo->rate ? USEC_PER_SEC : 100000U);
+    u32 packets;
     u64 delivery;
 
+    packets = tp->delivered - mundo->delivered;
+    if (packets < MIN_CWND)
+        return false;
     mundo_reset_sample(mundo, tp);
     if (elapsed > max_t(u64, 2 * USEC_PER_SEC, (u64)interval * 4))
     {
         /* An ACK outage is not a fresh capacity measurement. */
         mundo->delivery = 0;
         mundo->round = mundo->rate ? 7 : 0;
-        return;
+        return true;
     }
-    /* rate_sample.delivered overlaps earlier samples; never add it per ACK. */
+    /* Cumulative delivery is nonoverlapping and averages ACK compression. */
     delivery = clamp_t(u64, mul_u64_u32_div((u64)packets * tp->mss_cache,
                                           USEC_PER_SEC, elapsed), tp->mss_cache, MAX_PACING_RATE);
+    if (limited && (!mundo->rate || delivery < mundo->rate))
+        return false;
     if (mundo->rate)
     {
         u64 pacing = READ_ONCE(sk->sk_pacing_rate);
@@ -307,7 +310,7 @@ static void mundo_update_model(struct sock *sk, u32 elapsed, u32 packets)
             /* Sharing a configured ceiling is not a loss of path capacity. */
             mundo->delivery = delivery;
             mundo->round = 7;
-            return;
+            return true;
         }
     }
     if (!mundo->rate)
@@ -325,7 +328,7 @@ static void mundo_update_model(struct sock *sk, u32 elapsed, u32 packets)
             mundo->round = 7;
         }
         else
-            return; /* Keep the startup high-water mark across a low sample. */
+            return false; /* Keep the startup high-water mark across a low sample. */
     }
     else if (mundo->round == 1)
     {
@@ -365,6 +368,7 @@ static void mundo_update_model(struct sock *sk, u32 elapsed, u32 packets)
     mundo->delivery = delivery;
     if (mundo->rate)
         mundo->rate = clamp_t(u64, mundo->rate, tp->mss_cache, MAX_PACING_RATE);
+    return true;
 }
 
 #ifdef _LINUX_SOCKPTR_H
@@ -539,23 +543,14 @@ static void mundo_main(struct sock *sk, const struct rate_sample *rs)
     bool refresh = !mundo->rate;
 
     mundo_peer_set_active(mundo, flight != 0);
-    if (rs->delivered < 0 || rs->interval_us <= 0)
-        return;
     if (refresh && !rs->is_app_limited)
         tp->snd_cwnd = min_t(u64, (u64)tp->snd_cwnd + rs->acked_sacked, tp->snd_cwnd_clamp);
-    if (rs->is_app_limited && flight < max(tp->snd_cwnd / 16, 1U))
-        mundo_reset_sample(mundo, tp);
-    else
     {
         u32 elapsed = mundo_stamp(tp) - mundo->stamp;
-        u32 packets = tp->delivered - mundo->delivered;
         u32 interval = max_t(u32, tp->srtt_us >> 2, mundo->rate ? USEC_PER_SEC : 100000U);
 
-        if (elapsed >= interval && packets >= MIN_CWND)
-        {
-            mundo_update_model(sk, elapsed, packets);
-            refresh = true;
-        }
+        if (elapsed >= interval)
+            refresh |= mundo_update_model(sk, elapsed, interval, rs->is_app_limited);
     }
     if (refresh || (mundo->peer && mundo->active != atomic_read(&mundo->peer->active)))
         mundo_apply_rate(sk);

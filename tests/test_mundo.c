@@ -174,6 +174,25 @@ static void test_feedback_and_precision(void)
     stop(&sk);
 }
 
+static void test_cumulative_sample(void)
+{
+    struct sock sk;start(&sk,AF_INET,450);
+    struct mundo *m=inet_csk_ca(&sk);
+    m->rate=10000000;m->delivery=12000000;m->round=7;
+    mundo_apply_rate(&sk);
+    /* Invalid/overlapping native rate samples do not invalidate cumulative ACKs. */
+    struct rate_sample rs={.delivered=-1,.interval_us=0,.acked_sacked=1};
+    sk.tcp.tcp_mstamp+=USEC_PER_SEC;sk.tcp.delivered+=10000;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6,10,0)
+    mundo_main(&sk,0,0,&rs);
+#else
+    mundo_main(&sk,&rs);
+#endif
+    assert(m->delivery==12000000 && m->rate==12500000 && m->round==1);
+    assert(m->delivered==sk.tcp.delivered);
+    stop(&sk);
+}
+
 static void test_shared_ceiling_preserves_capacity(void)
 {
     struct sock sk;start(&sk,AF_INET,449);
@@ -252,7 +271,7 @@ static void *peer_worker(void *arg)
 int main(void)
 {
     assert(!mundo_register());
-    test_tuple_lifecycle();test_parameters_and_switch();test_feedback_and_precision();test_startup_jitter();test_delivery_model();test_shared_ceiling_preserves_capacity();
+    test_tuple_lifecycle();test_parameters_and_switch();test_feedback_and_precision();test_startup_jitter();test_delivery_model();test_cumulative_sample();test_shared_ceiling_preserves_capacity();
     pthread_t workers[8];
     for(int i=0;i<8;i++)assert(!pthread_create(&workers[i],NULL,peer_worker,NULL));
     for(int i=0;i<8;i++)assert(!pthread_join(workers[i],NULL));

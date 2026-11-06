@@ -239,7 +239,8 @@ static void suspended(void)
     assert(!getsockopt(paused.sender,IPPROTO_TCP,TCP_INFO,&info,&size));
     printf("suspended TCP window=%u unacked=%u lost=%u retrans=%u\n",
            info.tcpi_snd_wnd,info.tcpi_unacked,info.tcpi_lost,info.tcpi_total_retrans);
-    assert(info.tcpi_snd_wnd==0);
+    /* Sender SWS avoidance may leave a sub-MSS window instead of exact zero. */
+    assert(info.tcpi_snd_wnd<info.tcpi_snd_mss && info.tcpi_notsent_bytes>0);
     FILE *f=fopen("/sys/module/mundo/parameters/audit_active","r");
     if(f)
     {
