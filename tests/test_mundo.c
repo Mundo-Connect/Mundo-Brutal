@@ -222,6 +222,18 @@ static void test_startup_jitter(void)
     stop(&sk);
 
     start(&sk,AF_INET,447);
+    m=inet_csk_ca(&sk);sk.tcp.inflight=1000;
+    ack(&sk,USEC_PER_SEC,3750,false);
+    ack(&sk,USEC_PER_SEC,420,false);
+    ack(&sk,USEC_PER_SEC,840,false);
+    assert(!m->rate && m->delivery==1008000);
+    ack(&sk,USEC_PER_SEC,840,false);
+    assert(!m->rate);
+    ack(&sk,USEC_PER_SEC,840,false);
+    assert(m->rate==1008000);
+    stop(&sk);
+
+    start(&sk,AF_INET,447);
     assert(!params(&sk,MAX_PACING_RATE));
     for(int i=0;i<100;i++)ack(&sk,USEC_PER_SEC,1,true);
     assert(sk.tcp.snd_cwnd==TCP_INIT_CWND);

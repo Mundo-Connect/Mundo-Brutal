@@ -280,8 +280,8 @@ static bool mundo_update_model(struct sock *sk, u32 elapsed, u32 interval, bool 
 {
     struct tcp_sock *tp = tcp_sk(sk);
     struct mundo *mundo = inet_csk_ca(sk);
-    u32 packets;
-    u64 delivery;
+    u32 packets, mtu;
+    u64 delivery, pacing;
 
     packets = tp->delivered - mundo->delivered;
     if (packets < MIN_CWND)
@@ -299,20 +299,6 @@ static bool mundo_update_model(struct sock *sk, u32 elapsed, u32 interval, bool 
                                           USEC_PER_SEC, elapsed), tp->mss_cache, MAX_PACING_RATE);
     if (limited && (!mundo->rate || delivery < mundo->rate))
         return false;
-    if (mundo->rate)
-    {
-        u64 pacing = READ_ONCE(sk->sk_pacing_rate);
-        u32 mtu = tcp_mss_to_mtu(sk, tp->mss_cache);
-
-        if (pacing < div_u64(mundo->rate * mtu, tp->mss_cache) &&
-            delivery >= div_u64((pacing - pacing / 8) * tp->mss_cache, mtu))
-        {
-            /* Sharing a configured ceiling is not a loss of path capacity. */
-            mundo->delivery = delivery;
-            mundo->round = 7;
-            return true;
-        }
-    }
     if (!mundo->rate)
     {
         u64 window = mul_u64_u32_div(delivery, tp->srtt_us >> 3, USEC_PER_SEC);
@@ -320,7 +306,9 @@ static bool mundo_update_model(struct sock *sk, u32 elapsed, u32 interval, bool 
                                     TCP_INIT_CWND), tp->snd_cwnd_clamp);
 
         tp->snd_cwnd = min(tp->snd_cwnd, limit);
-        if (delivery > mundo->delivery + mundo->delivery / 16)
+        /* A sharp drop while busy starts a new baseline, not a plateau. */
+        if (delivery > mundo->delivery + mundo->delivery / 16 ||
+            delivery < mundo->delivery - mundo->delivery / 4)
             mundo->round = 0;
         else if (++mundo->round == 2)
         {
@@ -328,9 +316,23 @@ static bool mundo_update_model(struct sock *sk, u32 elapsed, u32 interval, bool 
             mundo->round = 7;
         }
         else
-            return false; /* Keep the startup high-water mark across a low sample. */
+            return false; /* Wait for the second comparable sample. */
+        mundo->delivery = delivery;
+        return true;
     }
-    else if (mundo->round == 1)
+
+    pacing = READ_ONCE(sk->sk_pacing_rate);
+    mtu = tcp_mss_to_mtu(sk, tp->mss_cache);
+    if (pacing < div_u64(mundo->rate * mtu, tp->mss_cache) &&
+        delivery >= div_u64((pacing - pacing / 8) * tp->mss_cache, mtu))
+    {
+        /* Sharing a configured ceiling is not a loss of path capacity. */
+        mundo->delivery = delivery;
+        mundo->round = 7;
+        return true;
+    }
+
+    if (mundo->round == 1)
     {
         if (delivery > mundo->delivery + mundo->delivery / 16)
             mundo->rate += mundo->rate / 4;
@@ -366,8 +368,7 @@ static bool mundo_update_model(struct sock *sk, u32 elapsed, u32 interval, bool 
     else
         mundo->round++;
     mundo->delivery = delivery;
-    if (mundo->rate)
-        mundo->rate = clamp_t(u64, mundo->rate, tp->mss_cache, MAX_PACING_RATE);
+    mundo->rate = clamp_t(u64, mundo->rate, tp->mss_cache, MAX_PACING_RATE);
     return true;
 }
 
